@@ -30,6 +30,12 @@ endif()
  
 add_compile_options($<$<CXX_COMPILER_ID:MSVC>:/MP>)
 
+# Enable PDB generation in release mode, but without the extra crap that RelWithDebInfo adds
+add_compile_options("$<$<CONFIG:Release>:/Zi>")
+add_link_options("$<$<CONFIG:Release>:/DEBUG>")
+add_link_options("$<$<CONFIG:Release>:/OPT:REF>")
+add_link_options("$<$<CONFIG:Release>:/OPT:ICF>")
+
 project(uevr-proj)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /MP")
@@ -65,12 +71,12 @@ FetchContent_Declare(bddisasm
 )
 FetchContent_MakeAvailable(bddisasm)
 
-message(STATUS "Fetching kananlib (ba66ffaeecfd201ac66310ddf0a4a98140f1441f)...")
+message(STATUS "Fetching kananlib (d34dd2130c9fb47b1cd5bd456ab72707e34d33bf)...")
 FetchContent_Declare(kananlib
 	GIT_REPOSITORY
 		"https://github.com/cursey/kananlib"
 	GIT_TAG
-		ba66ffaeecfd201ac66310ddf0a4a98140f1441f
+		d34dd2130c9fb47b1cd5bd456ab72707e34d33bf
 )
 FetchContent_MakeAvailable(kananlib)
 
@@ -590,6 +596,8 @@ set(LuaVR_SOURCES "")
 
 list(APPEND LuaVR_SOURCES
 	"lua-api/Main.cpp"
+	"lua-api/ScriptContext.cpp"
+	"lua-api/ScriptContext.hpp"
 )
 
 list(APPEND LuaVR_SOURCES
@@ -622,6 +630,7 @@ target_include_directories(LuaVR PUBLIC
 target_link_libraries(LuaVR PUBLIC
 	lua
 	sol2
+	kananlib
 )
 
 set_target_properties(LuaVR PROPERTIES
@@ -663,6 +672,9 @@ list(APPEND uevr_SOURCES
 	"src/mods/PluginLoader.cpp"
 	"src/mods/UObjectHook.cpp"
 	"src/mods/VR.cpp"
+	"src/mods/pluginloader/FFakeStereoRenderingFunctions.cpp"
+	"src/mods/pluginloader/FRHITexture2DFunctions.cpp"
+	"src/mods/pluginloader/FRenderTargetPoolHook.cpp"
 	"src/mods/uobjecthook/SDKDumper.cpp"
 	"src/mods/vr/Bindings.cpp"
 	"src/mods/vr/CVarManager.cpp"
@@ -698,6 +710,9 @@ list(APPEND uevr_SOURCES
 	"src/mods/PluginLoader.hpp"
 	"src/mods/UObjectHook.hpp"
 	"src/mods/VR.hpp"
+	"src/mods/pluginloader/FFakeStereoRenderingFunctions.hpp"
+	"src/mods/pluginloader/FRHITexture2DFunctions.hpp"
+	"src/mods/pluginloader/FRenderTargetPoolHook.hpp"
 	"src/mods/uobjecthook/SDKDumper.hpp"
 	"src/mods/vr/CVarManager.hpp"
 	"src/mods/vr/D3D11Component.hpp"

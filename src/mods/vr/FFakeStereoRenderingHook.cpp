@@ -125,6 +125,65 @@ void FFakeStereoRenderingHook::on_draw_ui() {
             m_tracking_system_hook->on_draw_ui();
         }
 
+        auto& data = m_viewport_rt_hook_data;
+        std::scoped_lock _{data.retaddr_mutex};
+
+        std::vector<uintptr_t> retaddrs{};
+        std::vector<std::string> items{};
+        for (auto& addr : data.seen_retaddrs) {
+            items.push_back(fmt::format("{:x}", addr));
+            retaddrs.push_back(addr);
+        }
+        
+        std::vector<const char*> citems{};
+        for (auto& item : items) {
+            citems.push_back(item.c_str());
+        }
+
+        if (!items.empty()) {
+            if (ImGui::BeginCombo("GetRenderTargetTexture Retaddrs", items[data.selected_retaddr].c_str())) {
+                for (int n = 0; n < items.size(); n++) {
+                    ImGui::PushID(n);
+                    auto retaddr = retaddrs[n];
+                    const bool is_selected = (data.selected_retaddr == n);
+
+                    // Calculate the text size for the current item
+                    const auto text_size = ImGui::CalcTextSize(items[n].c_str(), NULL, true);
+                    const auto padding = ImGui::GetStyle().ItemSpacing.x;
+                    const auto selectable_size = ImVec2{text_size.x + padding, text_size.y};
+
+                    if (ImGui::Selectable(items[n].c_str(), is_selected, ImGuiSelectableFlags_None, selectable_size)) {
+                        data.selected_retaddr = n;
+                    }
+
+                    ImGui::SameLine();
+                    if (ImGui::Button("Call Original")) {
+                        data.call_original_retaddrs.insert(retaddr);
+                        data.redirected_retaddrs.erase(retaddr);
+                    }
+
+                    ImGui::SameLine();
+                    if (ImGui::Button("Redirect")) {
+                        data.redirected_retaddrs.insert(retaddr);
+                        data.call_original_retaddrs.erase(retaddr);
+                    }
+
+                    ImGui::SameLine();
+                    if (data.call_original_retaddrs.contains(retaddr)) {
+                        ImGui::Text("[Calling Original]");
+                    } else if (data.redirected_retaddrs.contains(retaddr)) {
+                        ImGui::Text("[Redirected]");
+                    } else {
+                        ImGui::Text("[Default]");
+                    }
+
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+
+        }
+
         ImGui::TreePop();
     }
 
@@ -530,6 +589,8 @@ bool FFakeStereoRenderingHook::standard_fake_stereo_hook(uintptr_t vtable) {
     // Seems more robust than simply just checking the vtable index.
     m_uses_old_rendertarget_manager = *stereo_view_offset_index <= 11 && !render_texture_render_thread_func;
 
+    SPDLOG_INFO("Using old rendertarget manager: {}", m_uses_old_rendertarget_manager);
+
     if (!render_texture_render_thread_func) {
         // Fallback scan to checking for the first non-default virtual function (<= 4.18)
         SPDLOG_INFO("Failed to find RenderTexture_RenderThread, falling back to first non-default virtual function");
@@ -902,7 +963,7 @@ bool FFakeStereoRenderingHook::standard_fake_stereo_hook(uintptr_t vtable) {
         SPDLOG_INFO("AllocateRenderTarget index: {}", allocate_render_target_index);
 
         m_embedded_rtm.calculate_render_target_size_hook = 
-            std::make_unique<PointerHook>((void**)calculate_render_target_size_func_ptr, +[](void* self, const FViewport& viewport, uint32_t& x, uint32_t& y) {
+            std::make_unique<PointerHook>((void**)calculate_render_target_size_func_ptr, +[](void* self, const sdk::FViewport& viewport, uint32_t& x, uint32_t& y) {
             #ifdef FFAKE_STEREO_RENDERING_LOG_ALL_CALLS
                 SPDLOG_INFO("CalculateRenderTargetSize (embedded)");
             #else
@@ -953,7 +1014,7 @@ bool FFakeStereoRenderingHook::standard_fake_stereo_hook(uintptr_t vtable) {
 
         if (!need_reallocate_viewport_render_target_is_bad) {
             m_embedded_rtm.need_reallocate_viewport_render_target_hook = 
-                std::make_unique<PointerHook>((void**)need_reallocate_viewport_render_target_func_ptr, +[](void* self, FViewport* viewport) -> bool {
+                std::make_unique<PointerHook>((void**)need_reallocate_viewport_render_target_func_ptr, +[](void* self, sdk::FViewport* viewport) -> bool {
                 #ifdef FFAKE_STEREO_RENDERING_LOG_ALL_CALLS
                     SPDLOG_INFO("NeedReallocateViewportRenderTarget (embedded): {:x}", (uintptr_t)_ReturnAddress());
                 #else
@@ -1729,10 +1790,6 @@ void FFakeStereoRenderingHook::viewport_draw_hook(void* viewport, bool should_pr
 // This is only used for the UI compatibility mode.
 FRHITexture2D** FFakeStereoRenderingHook::viewport_get_render_target_texture_hook(sdk::FViewport* viewport) {
     const auto retaddr = (uintptr_t)_ReturnAddress();
-    static std::unordered_set<uintptr_t> redirected_retaddrs{};
-    static std::unordered_set<uintptr_t> call_original_retaddrs{};
-    static std::recursive_mutex retaddr_mutex{};
-    static bool has_view_family_tex{false};
 
     SPDLOG_INFO_ONCE("FViewport::GetRenderTargetTexture called!");
     const auto og = g_hook->m_viewport_get_render_target_texture_hook->get_original<decltype(&viewport_get_render_target_texture_hook)>();
@@ -1742,24 +1799,24 @@ FRHITexture2D** FFakeStereoRenderingHook::viewport_get_render_target_texture_hoo
         return og(viewport);
     }
 
+    auto& data = g_hook->m_viewport_rt_hook_data;
+
     {
-        std::scoped_lock _{retaddr_mutex};
+        std::scoped_lock _{data.retaddr_mutex};
+        utility::ScopeGuard guard{[&](){ data.seen_retaddrs.insert(retaddr); }};
 
-        if (call_original_retaddrs.contains(retaddr)) {
+        if (data.call_original_retaddrs.contains(retaddr)) {
             return og(viewport);
         }
 
-        // Hacky way to allow the first texture to go through
-        // For the games that are using something other than ViewFamilyTexture as the scene RT.
-        if (!call_original_retaddrs.empty() && !redirected_retaddrs.contains(retaddr) && !has_view_family_tex) {
-            return og(viewport);
-        }
+        std::optional<size_t> func_start{};
 
-        if (!redirected_retaddrs.contains(retaddr) && !call_original_retaddrs.contains(retaddr)) {
+        // ALWAYS check the retaddr for ViewFamilyTexture first and never skip it
+        // This will fix the case where we run into some other texture initially.
+        if (!data.seen_retaddrs.contains(retaddr)) {
             SPDLOG_INFO("FViewport::GetRenderTargetTexture called from {:x}", retaddr);
-            
-            // Analyze surrounding code to determine if this is a valid call.
-            auto func_start = utility::find_function_start(retaddr);
+
+            func_start = utility::find_function_start(retaddr);
 
             if (!func_start) {
                 func_start = retaddr;
@@ -1768,11 +1825,128 @@ FRHITexture2D** FFakeStereoRenderingHook::viewport_get_render_target_texture_hoo
             // The function that has this string reference should ALWAYS get passed
             // back to the original function, this is the actual scene render target.
             // Everything else we will redirect to the UI render target.
-            if (utility::find_string_reference_in_path(*func_start, L"ViewFamilyTexture", false)) {
+            if (utility::find_string_reference_in_path(*func_start, L"ViewFamilyTexture", false) || utility::find_string_reference_in_path(*func_start, L"ViewFamilyTarget", false)) {
                 SPDLOG_INFO("Found view family texture reference @ {:x}", retaddr);
-                call_original_retaddrs.insert(retaddr);
-                has_view_family_tex = true;
+                data.call_original_retaddrs.insert(retaddr);
+                data.has_view_family_tex = true;
                 return og(viewport);
+            }
+
+            // We should always allow the viewport when used in a post processing context to go through.
+            // There's two because this function stops itself at 200 instructions
+            // doing a second one from the retaddr allows us to go further.
+            if (utility::find_string_reference_in_path(*func_start, L"FinalPostProcessColor", false) || utility::find_string_reference_in_path(retaddr, L"FinalPostProcessColor", false)) {
+                SPDLOG_INFO("Found FinalPostProcessColor reference @ {:x}", retaddr);
+                data.call_original_retaddrs.insert(retaddr);
+                return og(viewport);
+            }
+
+            const auto next_fn_call = utility::scan_disasm(retaddr, 0x30, "E8 ? ? ? ?");
+
+            if (next_fn_call) {
+                const auto fn = utility::calculate_absolute(*next_fn_call + 1);
+
+                // I don't know of any other way to check this. I'm not sure what this function is.
+                // It seems like deep within a threaded or function for enqueueing a render command.
+                if (utility::scan(fn, 0x50, "01 01 01 01") && utility::scan(fn, 0x50, "22 00 00 00")) {
+                    SPDLOG_INFO("Found unknown screen space rendering call @ {:x}", retaddr);
+                    data.redirected_retaddrs.insert(retaddr);
+                }
+            }
+
+            // There are multiple other HAL references we can use too.
+            static const auto hal_clear_solid_rectangle_fn = utility::find_function_from_string_ref(utility::get_executable(), "HAL::ClearSolidRectangle");
+            static std::unordered_set<uintptr_t> scaleform_hal_vtable_functions{};
+
+            const auto is_scaleform = hal_clear_solid_rectangle_fn.has_value();
+
+            if (hal_clear_solid_rectangle_fn.has_value() && scaleform_hal_vtable_functions.empty()) try {
+                scaleform_hal_vtable_functions.insert(*hal_clear_solid_rectangle_fn);
+
+                SPDLOG_INFO("Found HAL::ClearSolidRectangle function @ {:x}", *hal_clear_solid_rectangle_fn);
+                std::vector<uintptr_t> scaleform_hal_vtable_refs{};
+                const auto module_size = utility::get_module_size(utility::get_executable()).value_or(0);
+                const auto start = (uintptr_t)utility::get_executable();
+                const auto end = (uintptr_t)utility::get_executable() + module_size;
+                const auto hal_module = utility::get_module_within(*hal_clear_solid_rectangle_fn).value_or(nullptr);
+
+                // There are multiple HAL vtable, so just collect all of them.
+                for (auto i = start; i < end - 0x1000; i += sizeof(uintptr_t)) {
+                    const auto remaining = end - i;
+                    const auto function_ptr = utility::scan_ptr(i, remaining - 0x1000, *hal_clear_solid_rectangle_fn);
+
+                    if (!function_ptr.has_value()) {
+                        break;
+                    }
+
+                    i = *function_ptr;
+
+                    SPDLOG_INFO("Found HAL::ClearSolidRectangle function pointer @ {:x}", *function_ptr);
+                    for (auto j = 0; j < 100; ++j) {
+                        const auto entry = *(uintptr_t*)(*function_ptr + (j * sizeof(uintptr_t)));
+
+                        if (entry == 0 || IsBadReadPtr((void*)entry, sizeof(uintptr_t))) {
+                            break;
+                        }
+
+                        const auto is_same_module = utility::get_module_within(entry).value_or(nullptr) == hal_module;
+
+                        if (!is_same_module) {
+                            break;
+                        }
+
+                        scaleform_hal_vtable_functions.insert(entry);
+                    }
+                }
+            } catch(...) {
+                SPDLOG_ERROR("Failed to find Scaleform HAL vtable functions!");
+            }
+
+            if (is_scaleform && !scaleform_hal_vtable_functions.empty()) try {
+                // Walk the stack, get function starts and check if any are in the vtable
+                constexpr auto max_stack_depth = 100;
+                uintptr_t stack[max_stack_depth]{};
+
+                const auto depth = RtlCaptureStackBackTrace(0, max_stack_depth, (void**)&stack, nullptr);
+
+                for (auto i = 0; i < depth; ++i) {
+                    SPDLOG_INFO(" Stack[{}]: {:x}", i, stack[i]);
+                }
+
+                bool found = false;
+
+                for (auto i = 1; i < std::min<uint16_t>(7, depth); ++i) {
+                    const auto scaleform_func_start = utility::find_virtual_function_start(stack[i]);
+
+                    if (!scaleform_func_start) {
+                        continue;
+                    }
+
+                    if (scaleform_hal_vtable_functions.contains(*scaleform_func_start)) {
+                        SPDLOG_INFO("Found Scaleform HAL vtable function reference @ {:x}", retaddr);
+                        data.redirected_retaddrs.insert(retaddr);
+                        found = true;
+                        break;
+                    }
+                }
+            } catch(...) {
+                SPDLOG_ERROR("Failed to walk stack for scaleform vtable functions!");
+            }
+        }
+
+        // Hacky way to allow the first texture to go through
+        // For the games that are using something other than ViewFamilyTexture as the scene RT.
+        if (!data.call_original_retaddrs.empty() && !data.redirected_retaddrs.contains(retaddr) && !data.has_view_family_tex) {
+            return og(viewport);
+        }
+
+        if (!data.redirected_retaddrs.contains(retaddr) && !data.call_original_retaddrs.contains(retaddr)) {
+            if (!func_start) {
+                func_start = utility::find_function_start(retaddr);
+
+                if (!func_start) {
+                    func_start = retaddr;
+                }
             }
 
             // Probably NOT...
@@ -1782,22 +1956,16 @@ FRHITexture2D** FFakeStereoRenderingHook::viewport_get_render_target_texture_hoo
                 return og(viewport);
             }*/
 
-            if (utility::find_string_reference_in_path(*func_start, L"FinalPostProcessColor", false)) {
-                SPDLOG_INFO("Found FinalPostProcessColor reference @ {:x}", retaddr);
-                call_original_retaddrs.insert(retaddr);
-                return og(viewport);
-            }
-
             // TODO? this needs some more rigorous filtering
             // some games are insane and have multiple "UnknownTexture" references...
             if (utility::find_string_reference_in_path(*func_start, L"UnknownTexture", false)) {
                 SPDLOG_INFO("Found unknown texture reference @ {:x}", retaddr);
-                call_original_retaddrs.insert(retaddr);
+                data.call_original_retaddrs.insert(retaddr);
                 return og(viewport);
             }
 
             SPDLOG_INFO("Redirecting FViewport::GetRenderTargetTexture call to UI render target @ {:x}", retaddr);
-            redirected_retaddrs.insert(retaddr);
+            data.redirected_retaddrs.insert(retaddr);
         }
     }
 
@@ -2221,6 +2389,10 @@ struct SceneViewExtensionAnalyzer {
         SPDLOG_INFO("Done setting up BeginRenderViewFamily hook!");
     }
 
+    static inline std::unordered_set<int> tested_execute_indices{};
+    static inline int correct_execute_index{0};
+    static inline bool found_correct_execute{false};
+
     template<int N>
     static void* hooked_command_fn(sdk::FRHICommandBase_New* cmd, sdk::FRHICommandListBase* cmd_list, void* debug_context, void* r9, void* stack_1, void* stack_2, void* stack_3, void* stack_4, void* stack_5, void* stack_6, void* stack_7, void* stack_8) {
         std::scoped_lock _{vtable_mutex};
@@ -2230,7 +2402,6 @@ struct SceneViewExtensionAnalyzer {
 
         if (once) {
             SPDLOG_INFO("[ISceneViewExtension] Successfully hijacked command list! {}", N);
-            once = false;
         }
 
         const auto original_vtable = original_vtables[cmd];
@@ -2239,20 +2410,39 @@ struct SceneViewExtensionAnalyzer {
         const auto func = (decltype(hooked_command_fn<N>)*)original_func;
         const auto frame_count = cmd_frame_counts[cmd];
 
+        if (once) {
+            SPDLOG_INFO("[ISceneViewExtension] Command list frame count: {}", frame_count);
+            SPDLOG_INFO("[ISceneViewExtension] Original vtable: {:x}", (uintptr_t)original_vtable);
+            once = false;
+        }
+
+        if (!found_correct_execute && !tested_execute_indices.contains(N) && VR::get()->get_present_thread_id() != 0) {
+            tested_execute_indices.insert(N);
+
+            // N == 0 is a pretty safe heuristic
+            // Otherwise if >= 1 gets called first, we can assume if the thread is the same
+            // as the DXGI present thread, then it's the correct execute function
+            if (N == 0 || GetCurrentThreadId() == VR::get()->get_present_thread_id()) {
+                correct_execute_index = N;
+                found_correct_execute = true;
+                SPDLOG_INFO("[ISceneViewExtension] Found correct execute index: {}", N);
+            }
+        }
+
         auto& vr = VR::get();
         auto runtime = vr->get_runtime();
 
         auto call_orig = [=]() {
             const auto result = func(cmd, cmd_list, debug_context, r9, stack_1, stack_2, stack_3, stack_4, stack_5, stack_6, stack_7, stack_8);
 
-            if (N == 0) {
+            if (N == correct_execute_index) {
                 runtime->enqueue_render_poses(frame_count);
             }
 
             return result;
         };
 
-        if (N != 0) {
+        if (N != correct_execute_index) {
             return call_orig();
         }
 
@@ -4282,8 +4472,6 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
     return out;
 }
 
-template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
-
 __forceinline void FFakeStereoRenderingHook::render_texture_render_thread(FFakeStereoRendering* stereo, FRHICommandListImmediate* rhi_command_list,
     FRHITexture2D* backbuffer, FRHITexture2D* src_texture, double window_size) 
 {
@@ -4969,7 +5157,7 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
 }
 
 // INTERNAL USE ONLY!!!!
-__declspec(noinline) void VRRenderTargetManager::CalculateRenderTargetSize(const FViewport& Viewport, uint32_t& InOutSizeX, uint32_t& InOutSizeY) {
+__declspec(noinline) void VRRenderTargetManager::CalculateRenderTargetSize(const sdk::FViewport& Viewport, uint32_t& InOutSizeX, uint32_t& InOutSizeY) {
     SPDLOG_INFO_ONCE("VRRenderTargetManager::CalculateRenderTargetSize called!");
 
     m_last_calculate_render_size_return_address = (uintptr_t)_ReturnAddress();
@@ -5014,7 +5202,7 @@ __declspec(noinline) bool VRRenderTargetManager::NeedReAllocateShadingRateTextur
     return false;
 }
 
-void VRRenderTargetManager_Base::update_viewport(bool use_separate_rt, const FViewport& vp, class SViewport* vp_widget) {
+void VRRenderTargetManager_Base::update_viewport(bool use_separate_rt, const sdk::FViewport& vp, class SViewport* vp_widget) {
     SPDLOG_INFO_ONCE("VRRenderTargetManager_Base::update_viewport called! {} {:x} {:x}", use_separate_rt, (uintptr_t)&vp, (uintptr_t)vp_widget);
 
     if (!g_framework->is_game_data_intialized()) {
@@ -5024,7 +5212,7 @@ void VRRenderTargetManager_Base::update_viewport(bool use_separate_rt, const FVi
     //SPDLOG_INFO("Widget: {:x}", (uintptr_t)ViewportWidget);
 }
 
-void VRRenderTargetManager_Base::calculate_render_target_size(const FViewport& viewport, uint32_t& x, uint32_t& y) {
+void VRRenderTargetManager_Base::calculate_render_target_size(const sdk::FViewport& viewport, uint32_t& x, uint32_t& y) {
     SPDLOG_INFO_ONCE("VRRenderTargetManager_Base::calculate_render_target_size called!");
 
 #ifdef FFAKE_STEREO_RENDERING_LOG_ALL_CALLS
@@ -5043,7 +5231,7 @@ void VRRenderTargetManager_Base::calculate_render_target_size(const FViewport& v
     SPDLOG_INFO("RenderTargetSize After: {}x{}", x, y);
 }
 
-bool VRRenderTargetManager_Base::need_reallocate_view_target(const FViewport& Viewport) {
+bool VRRenderTargetManager_Base::need_reallocate_view_target(const sdk::FViewport& Viewport) {
     SPDLOG_INFO_ONCE("VRRenderTargetManager_Base::need_reallocate_view_target called!");
 
     if (!g_framework->is_game_data_intialized()) {
@@ -5967,7 +6155,7 @@ __declspec(noinline) void FFakeStereoRenderingHook::update_viewport_rhi_hook(voi
     }
 
     if (!rtm.need_reallocate_viewport_render_target_called) {
-        const auto need_reallocate = g_hook->get_render_target_manager()->need_reallocate_view_target(*(FViewport*)viewport);
+        const auto need_reallocate = g_hook->get_render_target_manager()->need_reallocate_view_target(*(sdk::FViewport*)viewport);
 
         if (!need_reallocate) {
             SPDLOG_INFO_ONCE("Skipping UpdateViewportRHI (embedded) because NeedReallocateViewportRenderTarget() was not called and we don't need to reallocate anyway!");
